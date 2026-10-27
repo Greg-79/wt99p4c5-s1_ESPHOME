@@ -1,0 +1,636 @@
+# Board: Generic ESP32-P4 Board (pre-rev3) (Generic)
+# Definition: definitions/boards/generic-esp32p4/manifest.yaml
+esphome:
+  name: wireless-tag-p4
+  friendly_name: wireless-tag-p4
+  platformio_options:
+    # Use standard flash mode for better compatibility
+    board_build.arduino.memory_type: dio_qspi
+  on_boot:
+    - priority: -200
+      then:
+        # Enable the onboard amplifier (GPIO53) immediately on boot
+        - switch.turn_on: amp_enable
+        - delay: 200ms
+        # Initialize the ES8311 DAC volume to a safe 80%
+        - audio_dac.set_volume:
+            id: es8311_dac
+            volume: 80%
+esp32:
+  # The P4 is a newer high-performance ESP32 variant with Ethernet and high pin count
+  board: esp32-p4-evboard
+  variant: esp32p4
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    advanced:
+      # Required for some P4-specific hardware features in ESP-IDF
+      enable_idf_experimental_features: yes
+      
+psram:
+  speed: 200MHz
+
+esp_ldo:
+#  - channel: 3
+#    voltage: 2.5V
+  - channel: 4
+    voltage: 2.5V
+
+# Enable logging
+logger:
+  # Use the standard UART0 for serial logging
+  hardware_uart: UART0
+  level: INFO # Reduced from DEBUG for stability
+  logs:
+    # Keep audio logs for now, but reduce everything else
+    i2s_audio: INFO
+    i2s_audio.speaker: INFO
+    speaker: INFO
+    micro_wake_word: INFO
+    # Filter out noisy components once stable
+    component: INFO
+    ethernet: INFO
+    api: INFO
+    api.connection: INFO
+    mdns: INFO
+    safe_mode: INFO
+
+# This board has no native Wi-Fi. ESPHome's ``api:`` and
+# ``ota:`` components both require a ``network``
+# component — configure ``openthread:`` / ``ethernet:`` /
+# ``esp32_hosted:`` to suit your setup, then add ``api:``
+# and ``ota:`` blocks once the network is ready.
+ota:
+  - platform: esphome
+    password: "bf1c7324cdcd0f41044c7722cbf5a048"
+    
+globals:
+  - id: has_tts_response
+    type: bool
+    initial_value: 'false'
+  - id: tts_streaming
+    type: bool
+    initial_value: 'false'
+    
+esp32_hosted:
+  variant: esp32c5
+  active_high: true
+  reset_pin: GPIO54 #GPIO32
+  cmd_pin: GPIO19 #
+  clk_pin: GPIO18 #
+  d0_pin: GPIO14 #GPIO17
+  d1_pin: GPIO15 #GPIO16
+  d2_pin: GPIO16 #GPIO15
+  d3_pin: GPIO17 #GPIO14
+
+api:
+  encryption:
+    key: "JNk2BbFDjDHmQxuR718QB1rF8EE3owQHlg09w+NIcrQ="
+  on_client_connected:
+    - logger.log: "Home Assistant API connected!"
+    # Start Wake Word detection once HA is connected and ready
+    - micro_wake_word.start:
+    - lambda: |-
+        id(va_state).publish_state("Ready (Hey Jarvis)");
+  on_client_disconnected:
+    - logger.log: "Home Assistant API disconnected!"
+    # Stop everything on disconnect to save power and bus resources
+    - voice_assistant.stop:
+    - micro_wake_word.stop:
+    - lambda: |-
+        id(va_state).publish_state("No API Connection");
+        
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  
+i2c:
+  - id: bus_a
+    sda: GPIO7
+    scl: GPIO8
+    frequency: 400kHz
+    
+web_server:
+  version: 3
+  
+# ethernet:
+#   type: IP101
+#   mdc_pin: GPIO31
+#   mdio_pin: GPIO52
+#   clk: 
+#     pin: GPIO50
+#     mode: CLK_EXT_IN
+#   phy_addr: 1
+#   power_pin: GPIO51
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    i2c_id: bus_a
+    address: 0x18
+    use_mclk: True
+    use_microphone: False
+    mic_gain: 42DB
+    sample_rate: 16000
+    bits_per_sample: 16bit
+
+# -------------------------------------------------------------------
+# I2S AUDIO BUS CONFIGURATION
+# -------------------------------------------------------------------
+# Crucial: Since we have one physical I2S bus shared between Mic and Speaker,
+# ESPHome's 'try_lock' mechanism ensures they don't fight for the bus.
+# We must manually 'stop' the active component before starting the other.
+i2s_audio:
+  - id: i2s_bus
+    i2s_mclk_pin: GPIO13
+    i2s_bclk_pin: GPIO12
+    i2s_lrclk_pin: GPIO10
+#    use_legacy: false
+
+# -------------------------------------------------------------------
+# AUDIO SPEAKER PIPELINE
+# -------------------------------------------------------------------
+# We use a Mixer/Resampler pipeline to allow both Radio/TTS and Notifications
+# to flow to the same I2S hardware sink.
+speaker:
+  - platform: i2s_audio
+    id: i2s_speaker_out
+    dac_type: external
+    i2s_audio_id: i2s_bus
+    i2s_dout_pin: GPIO9
+    audio_dac: es8311_dac
+    channel: mono
+    num_channels: 1
+    # Increased buffer to handle network jitter and prevent TTS dropping out
+    buffer_duration: 1000ms
+    sample_rate: 16000
+    bits_per_sample: 16bit
+
+  - platform: resampler
+    id: announcement_spk_resampler
+    output_speaker: i2s_speaker_out
+
+# -------------------------------------------------------------------
+# MICROPHONE CONFIGURATION
+# -------------------------------------------------------------------
+# MICROPHONE CONFIGURATION
+# -------------------------------------------------------------------
+microphone:
+  - platform: i2s_audio
+    id: my_mic
+    i2s_audio_id: i2s_bus
+    i2s_din_pin: GPIO11
+    adc_type: external
+#    bits_per_channel: default
+
+# -------------------------------------------------------------------
+# MICRO WAKE WORD (WASH/HEY JARVIS)
+# -------------------------------------------------------------------
+micro_wake_word:
+  models:
+    - model: hey_jarvis
+      probability_cutoff: 0.6
+      sliding_window_size: 5
+  on_wake_word_detected:
+    - logger.log:
+        format: ">>> WAKE WORD DETECTED! <<<"
+        level: WARN
+    - lambda: |-
+        id(va_state).publish_state("Wake Word detected!");
+    # RELEVANT: Stop MWW immediately to release the I2S lock
+    # This allows the Voice Assistant pipeline to prepare the mic.
+    - micro_wake_word.stop:
+    # Wake up the Devolo Giga Bridge from power-saving mode
+    # A single UDP dummy packet before starting the audio stream "opens" the connection
+    - lambda: |-
+        int sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock >= 0) {
+            struct sockaddr_in dest_addr;
+            dest_addr.sin_addr.s_addr = inet_addr("${ha_ip}");
+            dest_addr.sin_family = AF_INET;
+            dest_addr.sin_port = htons(9);
+            const char* payload = "WAKEUP!";
+            sendto(sock, payload, strlen(payload), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            close(sock);
+        }
+    # Small delay to ensure the driver and network are ready
+    - delay: 100ms
+    # Start the Voice Assistant (no sound here to be as snappy as possible!)
+    - voice_assistant.start:
+
+# -------------------------------------------------------------------
+# VOICE ASSISTANT PIPELINE
+# -------------------------------------------------------------------
+voice_assistant:
+  id: va
+  microphone: my_mic
+  speaker: announcement_spk_resampler
+  # Disable on-device noise suppression completely. 
+  # It often aggressively cancels out distant voices as "background noise".
+  noise_suppression_level: 0
+  # Keep auto_gain high to pick up quiet voices from across the room
+  auto_gain: 31dBFS
+  volume_multiplier: 1.0
+
+  on_listening:
+    - globals.set:
+        id: has_tts_response
+        value: 'false'
+    - logger.log:
+        level: WARN
+        format: "VA: Listening..."
+    - lambda: |-
+        id(va_state).publish_state("Listening...");
+
+  on_stt_vad_end:
+    - logger.log:
+        level: WARN
+        format: "VA: Speech detected, stopping mic for feedback..."
+    - lambda: |-
+        id(va_state).publish_state("Processing...");
+    # STEP 1: Manually stop the Wake Word engine so the Speaker can acquire the I2S Bus lock
+    - micro_wake_word.stop:
+    # We ALSO explicitly stop the mic, just to be absolutely certain the bus is freed
+    - lambda: 'id(my_mic).stop();'
+    # STEP 2: Wait 300ms for the driver to fully release the hardware bus
+    - delay: 300ms
+    # STEP 3: Play 'Primer' (short silence) to wake up the DMA/DAC pipeline
+    - lambda: |-
+        std::vector<uint8_t> primer(3200, 0);
+        id(announcement_spk_resampler).play(primer.data(), primer.size());
+    - delay: 200ms
+    # STEP 4: Play the actual notification sound ('Pling') from embedded PCM array
+    # This array is defined inline as PROGMEM to save RAM and avoid external files.
+    - lambda: |-
+        #include <math.h>
+        // Algorithmic Pling Generator (16kHz, 16-bit, mono)
+        const int sample_rate = 16000;
+        const int duration_ms = 150;
+        const int num_samples = (sample_rate * duration_ms) / 1000;
+        std::vector<int16_t> pcm_data(num_samples);
+        const float frequency = 880.0; // A5 note
+        const float amplitude = 10000.0;
+        for (int i = 0; i < num_samples; ++i) {
+          float t = (float)i / sample_rate;
+          // Exponential decay envelope
+          float decay = exp(-t * 20.0f);
+          pcm_data[i] = (int16_t)(amplitude * sin(2.0 * M_PI * frequency * t) * decay);
+        }
+        id(announcement_spk_resampler).play((const uint8_t*)pcm_data.data(), pcm_data.size() * 2);
+    # STEP 5: Wait dynamically for the player to finish before starting the next pipeline step
+    - wait_until:
+        timeout: 1000ms
+        condition:
+          lambda: 'return !id(i2s_speaker_out).is_running();'
+    - logger.log:
+        level: WARN
+        format: "VA: Feedback finished, I2S bus ready for response"
+
+  on_stt_end:
+    - logger.log:
+        level: WARN
+        format: "VA STT: %s"
+        args: ['x.c_str()']
+    - lambda: |-
+        id(va_state).publish_state("Recognized: " + x);
+
+  on_tts_start:
+    - globals.set:
+        id: has_tts_response
+        value: 'true'
+    - logger.log:
+        level: WARN
+        format: "VA TTS: %s"
+        args: ['x.c_str()']
+    - lambda: |-
+        id(va_state).publish_state("Response: " + x);
+
+  on_tts_end:
+    - logger.log:
+        level: WARN
+        format: "VA: TTS Finished"
+
+  on_tts_stream_start:
+    - globals.set:
+        id: tts_streaming
+        value: 'true'
+    # CRITICAL FALLBACK: Ensure the wake word model releases its lock BEFORE the speaker stream starts!
+    # Without this, the speaker might crash with "Parent I2S bus not free"
+    - micro_wake_word.stop:
+    - lambda: 'id(my_mic).stop();'
+    # Send a tiny silent primer to wake up the DAC and amplifier smoothly into the queue
+    - lambda: |-
+        std::vector<uint8_t> primer(3200, 0);
+        id(announcement_spk_resampler).play(primer.data(), primer.size());
+    - logger.log:
+        level: WARN
+        format: "VA: Audio stream starting..."
+    - lambda: |-
+        id(va_state).publish_state("Playing Audio...");
+
+  on_tts_stream_end:
+    - globals.set:
+        id: tts_streaming
+        value: 'false'
+    - logger.log:
+        level: WARN
+        format: "VA: Audio stream finished"
+
+  on_end:
+    - logger.log:
+        level: WARN
+        format: "VA: Pipeline ended"
+    # Wait for the speaker to finalize the last bits of the response
+    - script.execute: wait_and_restart_wakeword
+
+  on_error:
+    - logger.log:
+        level: ERROR
+        format: "VA Error: %s (Code: %s)"
+        args: ['code.c_str()', 'message.c_str()']
+    - lambda: |-
+        id(va_state).publish_state("Error!");
+    - delay: 2s
+    - micro_wake_word.start:
+
+# -------------------------------------------------------------------
+# HELPER SCRIPT: ASYNC WAKE WORD RESTART
+# -------------------------------------------------------------------
+# This script waits until the speaker is idle before re-enabling MWW.
+# This prevents MWW from crashing the speaker during a stream.
+script:
+  - id: wait_and_restart_wakeword
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(has_tts_response);'
+          then:
+            # Wait for the network stream to officially open (timeout 5s in case of error)
+            - wait_until:
+                timeout: 5s
+                condition:
+                  lambda: 'return id(tts_streaming);'
+            - logger.log:
+                level: WARN
+                format: "Speaker active, waiting for stream to finish..."
+            # Wait for the network stream to close AND the local buffer to fully drain playing
+            - wait_until:
+                timeout: 60s
+                condition:
+                  lambda: 'return !id(tts_streaming) && !id(i2s_speaker_out).is_running();'
+      - logger.log:
+          level: WARN
+          format: "Speaker stopped, restarting Wake Word..."
+      - delay: 100ms
+      - micro_wake_word.start:
+      - lambda: |-
+          id(va_state).publish_state("Ready (Hey Jarvis)");
+
+# -------------------------------------------------------------------
+# HOME ASSISTANT CONTROLS (Numbers & Buttons)
+# -------------------------------------------------------------------
+number:
+  # Allows runtime microphone sensitivity adjustment on the ES8311 Codec
+  - platform: template
+    name: "Microphone Gain"
+    id: mic_gain_control
+    min_value: 0
+    max_value: 42
+    step: 3
+    unit_of_measurement: "dB"
+    initial_value: 42
+    optimistic: true
+    on_value:
+      - lambda: |-
+          uint8_t index = (uint8_t)(x / 3.0);
+          if (index > 14) index = 14; 
+          uint8_t reg_val = 0x10 | index; 
+          id(es8311_dac).write_byte(0x14, reg_val);
+          ESP_LOGI("config", "ES8311 Mic Gain set to: %.0f dB (Reg 0x14: 0x%02X)", x, reg_val);
+
+  - platform: template
+    name: "Noise Suppression Level"
+    id: ns_level_control
+    min_value: 0
+    max_value: 4
+    step: 1
+    initial_value: 0
+    optimistic: true
+    on_value:
+      - lambda: |-
+          ESP_LOGI("config", "New Noise Suppression Level: %.0f", x);
+
+  # Hardware volume control for the onboard speaker
+  - platform: template
+    name: "Speaker Volume"
+    id: spk_volume_control
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    initial_value: 80
+    optimistic: true
+    on_value:
+      - lambda: |-
+          uint8_t reg_val = (uint8_t)((100.0 - x) * 1.9); 
+          id(es8311_dac).write_byte(0x32, reg_val);
+          ESP_LOGI("config", "Speaker Volume set to: %.0f%% (Reg 0x32: 0x%02X)", x, reg_val);
+
+# -------------------------------------------------------------------
+# AMPLIFIER CONTROL
+# -------------------------------------------------------------------
+switch:
+  - platform: gpio
+    pin: GPIO53
+    name: "Amplifier Enable"
+    id: amp_enable
+    restore_mode: ALWAYS_ON
+
+# -------------------------------------------------------------------
+# DIAGNOSTIC TOOLS
+# -------------------------------------------------------------------
+button:
+  - platform: template
+    name: "Speaker Diagnostics"
+    id: speaker_diag
+    icon: "mdi:stethoscope"
+    on_press:
+      - lambda: |-
+          ESP_LOGW("diag", "========== DIAGNOSTICS ==========");
+          ESP_LOGW("diag", "Free Heap: %u bytes", esp_get_free_heap_size());
+          ESP_LOGW("diag", "Amp: %s", id(amp_enable).state ? "ON" : "OFF");
+          uint8_t val;
+          id(es8311_dac).read_byte(0x37, &val);
+          ESP_LOGW("diag", "DAC Power (0x37): 0x%02X (0x08=on)", val);
+          id(es8311_dac).read_byte(0x33, &val);
+          ESP_LOGW("diag", "DAC Mute (0x33): 0x%02X (0x00=unmuted)", val);
+          ESP_LOGW("diag", "=================================");
+
+  - platform: template
+    name: "Play Test Sound"
+    id: play_test_tone_synth
+    icon: "mdi:volume-high"
+    on_press:
+      - micro_wake_word.stop:
+      - delay: 500ms
+      - lambda: |-
+          std::vector<uint8_t> data;
+          for (int i = 0; i < 8000; i++) {
+              int16_t sample = ((i / 8) % 2 == 0) ? 32000 : -32000;
+              data.push_back(sample & 0xFF);
+              data.push_back((sample >> 8) & 0xFF);
+          }
+          id(announcement_spk_resampler).play(data.data(), data.size());
+          ESP_LOGI("test", "Test tone played");
+      - delay: 2000ms
+      - micro_wake_word.start:
+
+# -------------------------------------------------------------------
+# UI STATE SENSOR
+# -------------------------------------------------------------------
+text_sensor:
+  - platform: template
+    name: "Voice Assistant State"
+    id: va_state
+    lambda: |-
+      return {};
+    update_interval: never
+
+spi:
+  clk_pin: GPIO4    # Замени на свой реальный пин
+  mosi_pin: GPIO5   # Замени на свой реальный пин
+  interface: hardware
+  
+external_components:
+  - source: github://mortiser/esphome-gc9b72
+    components: [ gc9b72 ]
+    
+output:
+  - platform: ledc
+    pin: GPIO6
+    id: backlight_pwm
+    frequency: 1000Hz
+
+display:
+  - platform: gc9b72
+    id: my_display
+    cs_pin: GPIO27
+    dc_pin: GPIO48
+    reset_pin: GPIO47
+    rotation: 0°
+#    update_interval: 1s
+
+lvgl:
+  displays:
+    - my_display
+#  color_depth: 16
+#  byte_order: big_endian     
+#  buffer_size: 15%
+#  full_refresh: true
+#  draw_rounding: 4
+  bg_color: 0x000000
+  scrollable: false
+  top_layer:
+    widgets:
+      - led:
+          id: led_id
+          align: CENTER
+          width: 360
+          height: 360
+          color: 0xFF0000
+          brightness: 100%
+          bg_opa: 0%
+          line_color: 0xff0000
+  page_wrap: true
+  pages:
+
+    - id: page_text
+      widgets:
+        - label:
+            align: center
+            y: -120
+            text: "Привет!"
+            text_color: 0xffffff
+            text_font: font_52
+        - label:
+            align: center
+            y: -70
+            text: "Привет!"
+            text_color: 0xff0000
+            text_font: font_52
+        - label:
+            align: center
+            y: 0
+            text: "Привет!"
+            text_color: 0xFFFF00
+            text_font: font_52            
+        - label:
+            align: center
+            y: 70
+            text: "Привет!"
+            text_color: 0x00FF00
+            text_font: font_52
+        - label:
+            align: center
+            y: 120
+            text: "Привет!"
+            text_color: 0x0000ff
+            text_font: font_52
+
+font:
+  - file: "display/gfonts/Roboto-Regular.ttf"
+    id: font_52
+    size: 50
+    bpp: 2
+    glyphs: |-
+      !"%()+=,-_.:³°<>μ0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчшщьыъэюяabcdefghijklmnopqrstuvwxyz'/
+
+  - file: "display/gfonts/Roboto-Regular.ttf"
+    id: font_30
+    size: 30
+    bpp: 2
+    glyphs: |-
+      !"%()+=,-_.:³°<>μ0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчшщьыъэюяabcdefghijklmnopqrstuvwxyz'/
+
+  - file: "display/gfonts/Roboto-Regular.ttf"
+    id: roboto24
+    size: 24
+    bpp: 2
+    glyphs: |-
+      !"%()+=,-_.:³°<>μ0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчщьыъэюяabcdefghijklmnopqrstuvwxyz'/&
+
+#  - file: "display/gfonts/Roboto-Regular.ttf"
+#    id: roboto32
+#    size: 32
+#    glyphs: |-
+#      !"%()+=,-_.:³°<>μ0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчшщьыъэюяabcdefghijklmnopqrstuvwxyz'/&
+
+  - file: "display/gfonts/Roboto-Regular.ttf"
+    id: roboto20
+    size: 20
+    bpp: 2
+    glyphs: |-
+      !"%()+=,-_.:³°<>μ0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчшщьыъэюяabcdefghijklmnopqrstuvwxyz'
+    ignore_missing_glyphs: true
+
+  - file: "display/gfonts/Roboto-Regular.ttf"
+    id: roboto60
+    size: 80
+    bpp: 2
+    glyphs: |-
+      !"%()+=,-_.:³°μ0123456789АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЬЫЪЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ абвгдеёжзийклмнопрстуфхцчшщьыъэюяabcdefghijklmnopqrstuvwxyz'/&
+
+  - file: "display/gfonts/icons_v2.ttf"
+    id: icons
+    size: 28 #24
+    bpp: 2
+    glyphs: [
+      "\U0000e935", # home assistant
+      "\U0000e931", # wifi signal from 25% to 1%
+      "\U0000e932", # wifi signal from 50% to 25%
+      "\U0000e933", # wifi signal from 75% to 50%
+      "\U0000e934", # wifi signal from 100% to 75% or disable
+      "\U0000e938", # humidity
+      "\U0000e939", #temperature_icon
+    ]    
